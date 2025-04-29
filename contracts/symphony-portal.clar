@@ -149,3 +149,377 @@
 (define-private (composition-exists (composition-id uint))
     (is-some (map-get? composition-registry {identifier: composition-id}))
 )
+
+;; Verifies rights holder status for a composition
+(define-private (is-rights-holder (composition-id uint) (user principal))
+    (match (map-get? composition-registry {identifier: composition-id})
+        composition-data (is-eq (get rights-holder composition-data) user)
+        false
+    )
+)
+
+;; Retrieves composition length in seconds
+(define-private (get-composition-length (composition-id uint))
+    (default-to u0 
+        (get length-seconds 
+            (map-get? composition-registry {identifier: composition-id})
+        )
+    )
+)
+
+;; Validates that a descriptive element conforms to length requirements
+(define-private (is-valid-descriptor (descriptor (string-ascii 24)))
+    (and 
+        (> (len descriptor) u0)
+        (< (len descriptor) u25)
+    )
+)
+
+;; Validates that a collection of descriptors meets system requirements
+(define-private (are-valid-descriptors (descriptors (list 8 (string-ascii 24))))
+    (and
+        (> (len descriptors) u0)
+        (<= (len descriptors) u8)
+        (is-eq (len (filter is-valid-descriptor descriptors)) (len descriptors))
+    )
+)
+
+;; Retrieves latest collection identifier for a curator
+(define-private (get-latest-collection-id (curator principal))
+    (get latest-collection-id (default-to {latest-collection-id: u0} 
+        (map-get? curator-collection-counters {curator: curator})))
+)
+
+;; Prepares composition identifiers for bulk operations
+(define-private (prepare-composition-id (composition-id uint))
+    {composition-id: composition-id}
+)
+
+;; Adds composition to ensemble during bulk operations
+(define-private (integrate-composition-to-ensemble (composition-data {composition-id: uint}))
+    (let
+        ((composition-id (get composition-id composition-data)))
+        (and 
+            (composition-exists composition-id)
+            (map-insert ensemble-compositions
+                {ensemble-id: (var-get ensemble-registry-size), composition-id: composition-id}
+                {
+                    contributor: tx-sender,
+                    addition-timestamp: block-height
+                }
+            )
+        )
+    )
+)
+
+;; ------------------------------------------------------------
+;; Primary System Operations (Public)
+;; ------------------------------------------------------------
+
+;; Registers a new composition in the system
+(define-public (register-composition 
+        (name (string-ascii 64))
+        (composer (string-ascii 32))
+        (length-seconds uint)
+        (category (string-ascii 32))
+        (descriptors (list 8 (string-ascii 24)))
+    )
+    (let
+        ((new-composition-id (+ (var-get composition-registry-size) u1)))
+
+        ;; Input validation
+        (asserts! (and (> (len name) u0) (< (len name) u65)) ERROR-INVALID-NAME)
+        (asserts! (and (> (len composer) u0) (< (len composer) u33)) ERROR-INVALID-NAME)
+        (asserts! (and (> length-seconds u0) (< length-seconds u10000)) ERROR-INVALID-LENGTH)
+        (asserts! (and (> (len category) u0) (< (len category) u33)) ERROR-INVALID-NAME)
+        (asserts! (are-valid-descriptors descriptors) ERROR-INVALID-NAME)
+
+        ;; Add composition to registry
+        (map-insert composition-registry
+            {identifier: new-composition-id}
+            {
+                name: name,
+                composer: composer,
+                rights-holder: tx-sender,
+                length-seconds: length-seconds,
+                registration-block: block-height,
+                category: category,
+                descriptive-elements: descriptors
+            }
+        )
+
+        ;; Establish initial access privileges
+        (map-insert access-privileges
+            {composition-identifier: new-composition-id, listener: tx-sender}
+            {access-granted: true}
+        )
+
+        ;; Update registry size and return new identifier
+        (var-set composition-registry-size new-composition-id)
+        (ok new-composition-id)
+    )
+)
+
+;; Deregisters a composition from the system
+(define-public (deregister-composition (composition-id uint))
+    (let
+        ((composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING)))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (is-eq (get rights-holder composition-data) tx-sender) ERROR-NOT-AUTHORIZED)
+
+        ;; Remove composition data
+        (map-delete composition-registry {identifier: composition-id})
+        (map-delete access-privileges {composition-identifier: composition-id, listener: tx-sender})
+        (ok true)
+    )
+)
+
+;; Transfers composition rights to a new holder
+(define-public (transfer-composition-rights (composition-id uint) (new-rights-holder principal))
+    (let
+        ((composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING)))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (is-eq (get rights-holder composition-data) tx-sender) ERROR-NOT-AUTHORIZED)
+
+        ;; Update rights holder
+        (map-set composition-registry
+            {identifier: composition-id}
+            (merge composition-data {rights-holder: new-rights-holder})
+        )
+        (ok true)
+    )
+)
+
+;; Updates composition details
+(define-public (update-composition-details 
+        (composition-id uint) 
+        (new-name (string-ascii 64)) 
+        (new-length-seconds uint) 
+        (new-category (string-ascii 32)) 
+        (new-descriptors (list 8 (string-ascii 24)))
+    )
+    (let
+        ((composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING)))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (is-eq (get rights-holder composition-data) tx-sender) ERROR-NOT-AUTHORIZED)
+        (asserts! (and (> (len new-name) u0) (< (len new-name) u65)) ERROR-INVALID-NAME)
+        (asserts! (and (> new-length-seconds u0) (< new-length-seconds u10000)) ERROR-INVALID-LENGTH)
+        (asserts! (and (> (len new-category) u0) (< (len new-category) u33)) ERROR-INVALID-NAME)
+        (asserts! (are-valid-descriptors new-descriptors) ERROR-INVALID-NAME)
+
+        ;; Update composition details
+        (map-set composition-registry
+            {identifier: composition-id}
+            (merge composition-data {
+                name: new-name,
+                length-seconds: new-length-seconds,
+                category: new-category,
+                descriptive-elements: new-descriptors
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Adds composition to personal collection
+(define-public (add-to-personal-collection 
+        (collection-id uint)
+        (composition-id uint)
+    )
+    (let
+        ((collection-data (unwrap! (map-get? melodic-collections {curator: tx-sender, collection-id: collection-id}) ERROR-ASSET-MISSING))
+         (composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING))
+         (listener-access (default-to {access-granted: false} (map-get? access-privileges {composition-identifier: composition-id, listener: tx-sender}))))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (or 
+                    (is-eq (get rights-holder composition-data) tx-sender)
+                    (get access-granted listener-access)
+                  ) 
+                ERROR-PERMISSION-REJECTED)
+
+        ;; Check for duplicates
+        (asserts! (is-none (map-get? collection-compositions {collection-curator: tx-sender, collection-id: collection-id, composition-id: composition-id})) 
+                 ERROR-ASSET-EXISTS)
+
+        (ok true)
+    )
+)
+
+;; Grants access to a composition
+(define-public (grant-composition-access 
+        (composition-id uint)
+        (recipient principal)
+    )
+    (let
+        ((composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING)))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (is-eq (get rights-holder composition-data) tx-sender) ERROR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq tx-sender recipient)) ERROR-INVALID-NAME)
+
+        ;; Check for existing grant
+        (asserts! (is-none (map-get? access-privileges {composition-identifier: composition-id, listener: recipient})) 
+                 ERROR-ASSET-EXISTS)
+
+        ;; Grant access
+        (map-insert access-privileges
+            {composition-identifier: composition-id, listener: recipient}
+            {access-granted: true}
+        )
+
+        ;; Record grant history
+        (map-insert privilege-history
+            {composition-id: composition-id, grantor: tx-sender, recipient: recipient}
+            {
+                grant-timestamp: block-height,
+                revocation-timestamp: u0,
+                privilege-active: true
+            }
+        )
+
+        (ok true)
+    )
+)
+
+;; Revokes previously granted access
+(define-public (revoke-composition-access 
+        (composition-id uint)
+        (recipient principal)
+    )
+    (let
+        ((composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING))
+         (access-data (unwrap! (map-get? privilege-history {composition-id: composition-id, grantor: tx-sender, recipient: recipient}) ERROR-ASSET-MISSING)))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (is-eq (get rights-holder composition-data) tx-sender) ERROR-NOT-AUTHORIZED)
+        (asserts! (get privilege-active access-data) ERROR-PERMISSION-REJECTED)
+
+        (ok true)
+    )
+)
+
+;; Submits listener feedback for a composition
+(define-public (submit-composition-feedback 
+        (composition-id uint)
+        (score uint)
+        (commentary (optional (string-ascii 256)))
+    )
+    (let
+        ((composition-data (unwrap! (map-get? composition-registry {identifier: composition-id}) ERROR-ASSET-MISSING))
+         (listener-access (default-to {access-granted: false} (map-get? access-privileges {composition-identifier: composition-id, listener: tx-sender})))
+         (existing-feedback (map-get? listener-feedback {composition-id: composition-id, evaluator: tx-sender})))
+
+        ;; Validation
+        (asserts! (composition-exists composition-id) ERROR-ASSET-MISSING)
+        (asserts! (or 
+                    (is-eq (get rights-holder composition-data) tx-sender)
+                    (get access-granted listener-access)
+                  ) 
+                ERROR-PERMISSION-REJECTED)
+        (asserts! (and (>= score u1) (<= score u5)) ERROR-INVALID-NAME)
+
+        ;; Validate commentary length if provided
+        (if (is-some commentary)
+            (asserts! (and 
+                        (> (len (default-to "" commentary)) u0) 
+                        (< (len (default-to "" commentary)) u257)
+                      ) 
+                    ERROR-INVALID-NAME)
+            true
+        )
+
+        ;; Store or update feedback
+        (if (is-some existing-feedback)
+            ;; Update existing feedback
+            (map-set listener-feedback
+                {composition-id: composition-id, evaluator: tx-sender}
+                {
+                    score: score,
+                    commentary: commentary,
+                    update-timestamp: block-height,
+                    initial-evaluation-timestamp: (get initial-evaluation-timestamp (unwrap! existing-feedback ERROR-ASSET-MISSING))
+                }
+            )
+            ;; Create new feedback
+            (map-insert listener-feedback
+                {composition-id: composition-id, evaluator: tx-sender}
+                {
+                    score: score,
+                    commentary: commentary,
+                    update-timestamp: block-height,
+                    initial-evaluation-timestamp: block-height
+                }
+            )
+        )
+
+        ;; Update feedback statistics
+        (match (map-get? feedback-statistics {composition-id: composition-id})
+            existing-stats (map-set feedback-statistics
+                {composition-id: composition-id}
+                (merge existing-stats {
+                    evaluation-count: (if (is-some existing-feedback) 
+                                      (get evaluation-count existing-stats) 
+                                      (+ (get evaluation-count existing-stats) u1)),
+                    last-evaluated-timestamp: block-height
+                })
+            )
+            (map-insert feedback-statistics
+                {composition-id: composition-id}
+                {
+                    evaluation-count: u1,
+                    last-evaluated-timestamp: block-height
+                }
+            )
+        )
+
+        (ok true)
+    )
+)
+
+;; Creates a thematic ensemble of compositions
+(define-public (establish-themed-ensemble
+        (ensemble-title (string-ascii 64))
+        (description (string-ascii 256))
+        (style (string-ascii 32))
+        (initial-compositions (list 20 uint))
+        (collaborative-status bool)
+    )
+    (let
+        ((new-ensemble-id (+ (var-get ensemble-registry-size) u1))
+         (valid-compositions (filter composition-exists initial-compositions)))
+
+        ;; Validation
+        (asserts! (and (> (len ensemble-title) u0) (< (len ensemble-title) u65)) ERROR-INVALID-NAME)
+        (asserts! (and (> (len description) u0) (< (len description) u257)) ERROR-INVALID-NAME)
+        (asserts! (and (> (len style) u0) (< (len style) u33)) ERROR-INVALID-NAME)
+
+        ;; Register founder as contributor
+        (map-insert ensemble-contributors
+            {ensemble-id: new-ensemble-id, contributor: tx-sender}
+            {
+                contributor-status: true,
+                joining-timestamp: block-height,
+                founder-status: true
+            }
+        )
+
+        ;; Add validated compositions to ensemble
+        (map integrate-composition-to-ensemble (map prepare-composition-id valid-compositions))
+
+        ;; Update ensemble registry size
+        (var-set ensemble-registry-size new-ensemble-id)
+
+        (ok new-ensemble-id)
+    )
+)
+
